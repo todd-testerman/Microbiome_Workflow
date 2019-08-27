@@ -1,0 +1,320 @@
+---
+title: "Qiime2 to decontam, Phyloseq, DESeq2, pheatmap"
+author: "Todd Testerman"
+date: "March 15, 2019"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+*Please note that many of these commands are drawn from online sources and tutorials. This document is intended to tie many facets together for an ease of transition and accessibility*
+
+This walkthrough will take the output files from a Qiime2 analysis and import them into R/phyloseq for further processing and analysis. If using the script present within the lab, file names below for input (table.qza, etc) should match what was output from the Qiime2 script. This means that you only need to set the working directory in RStudio before running the below code. If your file names have been changed, be sure to update the input values that follow. 
+
+**Before import, ensure that your mapping file has the following two columns: "Sample_or_Control" and "quant_reading". Assign "Control Sample" or "True Sample" to each sample and add in Qubit values for each sample as well in the "quant_reading" column.**
+These are used with the two methods for identifying contaminants in the first package we will use. Additionally, ensure that the "SampleID" column in your mapping file does not start with a "#". This symbol is allowable in Qiime2 (as a legacy from Qiime1) but will cause the importer to treat the header row as a coding comment which will obviously cause problems. 
+
+The first step is to load the necessary packages. pacman will install and load any missing packages.
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(decontam, phyloseq, BiocManager, qiime2R, DESeq2, tidyverse, RColorBrewer, viridis, vegan, pheatmap)
+```
+
+This step is the only portion of the script that utilizes the Qiime2R plugin. You can change the name of the phyloseq object as needed. You are inputting standard phyloseq requirements but in this case there is no need to convert .qza files as this is handled by the package. 
+
+```{r}
+phy = qza_to_phyloseq("table.qza", "rooted-tree.qza", "taxonomy.qza","map_file.txt",tmp = "C:/tmp")
+```
+
+Here we are removing an artifact from the Qiime2 process flow. Taxonomy has prefixes coming from Qiime2 to denote taxonomic level but since phyloseq stores this information separately, these are no longer needed. The first command is for Greengenes and the second is if the Silva database was during taxonomy assignment in Qiime2.
+
+```{r}
+phy@tax_table = gsub("k__|p__|o__|c__|f__|g__|s__", "", phy@tax_table)
+#phy@tax_table = gsub("D_0__|D_1__|D_2__|D_3__|D_4__|D_5__|D_6__", "", phy@taxtable) for Silva-generated taxonomy
+```
+
+#decontam
+
+*browseVignettes(decontam) for more information*
+
+Now that we have our phyloseq object successfully imported into R, we should preprocess our data to account for contaminants. Luckily, this dataset has plenty of controls which gives sufficient power to this method. Note that it is highly recommended you have 2+ controls in any given dataset. Here is the intro for decontam provided by the creators:
+
+>The investigation of environmental microbial communities and microbiomes has been transformed by the recent widespread adoption of culture-free high-throughput sequencing methods. In amplicon sequencing a particular genetic locus is amplified from DNA extracted from the community of interest, and then sequenced on a next-generation sequencing platform. In shotgun metagenomics, bulk DNA is extracted from the community of interest and sequenced. Both techniques provide cost-effective and culture-free characterizatoins of microbial communities.
+>
+>However, the accuracy of these methods is limited in practice by the introduction of contaminating DNA that was not truly present in the sampled community. This contaminating DNA can come from several sources, such as the reagents used in the sequencing reaction, and can critically interfere with downstream analyses, especially in lower biomass environments. The decontam package provides simple statistical methods to identify and visualize contaminating DNA features, allowing them to be removed and a more accurate picture of sampled communities to be constructed from marker-gene and metagenomics data.
+
+Let's first assess how many taxa are present in our new phyloseq object. 
+
+```{r}
+ntaxa(phy)
+```
+
+Now let's see if decontam can identify any contaminants in our dataset. The method shown below is one of the two methods decontam offers and is known as "Prevalence-Based" identification. The other option is "Frequency-based". Frequency-based uses the concentrations of your samples (in the quant_reading column). Prevalence-based simply uses the information in the "Sample_or_Control" column and is looking for taxa that appear in controls and whether they appear across your samples. The choice between the two often falls to the biomass of the samples you are analyzing where frequency-based filtering is less reliable with low biomass samples whereas prevalence-based filtering holds up better. For this reason, we will use prevalence-based as many of these samples were low biomass. 
+
+The first steps we take are adding a new column to our sample data denoting if a sample "is.neg". This is assigned based on what is present in the Sample or Control column. We then run the primary decontam command "isContaminant" and add our method as previously discussed and how we are designating the negatives. We can then build an object using phyloseq commands where presence absence of taxa are extracted as well as sample data for controls and real samples. These are then combined in a data frame where taxa counts are summed within each group, added as columns, the contaminant call is also added where a TRUE/FALSE designation appears next to each ASV whether it was considered a contaminant. We can then make a ggplot object of this where the prevalence (number of samples an ASV appears in) is plotted for positive and negative samples and colored based on being a contaminant. If we are satisfied with this (we see obvious contaminants being picked out in controls) we can then remove these from the phyloseq object with prune_taxa and "!" is a logical operator meaning "not", and thus the list of contaminants from our object are removed from the phyloseq object. We can check for proper removal by querying the number of taxa once again. 
+
+```{r}
+sample_data(phy)$is.neg <- sample_data(phy)$Sample_or_Control == "Control Sample"
+contamdf.prev <- isContaminant(phy, method="prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+phy.pa <- transform_sample_counts(phy, function(abund) 1*(abund>0))
+phy.pa.neg <- prune_samples(sample_data(phy.pa)$Sample_or_Control == "Control Sample", phy.pa)
+phy.pa.pos <- prune_samples(sample_data(phy.pa)$Sample_or_Control == "True Sample", phy.pa)
+df.pa <- data.frame(pa.pos=taxa_sums(phy.pa.pos), pa.neg=taxa_sums(phy.pa.neg),
+                      contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+phy <- prune_taxa(!contamdf.prev$contaminant, phy)
+ntaxa(phy)
+```
+#Phyloseq
+>The analysis of microbiological communities brings many challenges: the integration of many different types of data with methods from ecology, genetics, phylogenetics, network analysis, visualization and testing. The data itself may originate from widely different sources, such as the microbiomes of humans, soils, surface and ocean waters, wastewater treatment plants, industrial facilities, and so on; and as a result, these varied sample types may have very different forms and scales of related data that is extremely dependent upon the experiment and its question(s). The phyloseq package is a tool to import, store, analyze, and graphically display complex phylogenetic sequencing data that has already been clustered into Operational Taxonomic Units (OTUs), especially when there is associated sample data, phylogenetic tree, and/or taxonomic assignment of the OTUs. This package leverages many of the tools available in R for ecology and phylogenetic analysis (vegan, ade4, ape, picante), while also using advanced/flexible graphic systems (ggplot2) to easily produce publication-quality graphics of complex phylogenetic data. phyloseq uses a specialized system of S4 classes to store all related phylogenetic sequencing data as single experiment-level object, making it easier to share data and reproduce analyses. In general, phyloseq seeks to facilitate the use of R for efficient interactive and reproducible analysis of OTU-clustered high-throughput phylogenetic sequencing data.
+
+*browseVignettes(phyloseq) for more information*
+
+These next steps are exploratory figures to get an idea of what your data looks like and ensure things have been imported correctly. A simple barplot command will automatically plot samples on the x-axis vs summed abundance (read depth) on the y-axis.
+
+```{r}
+plot_bar(phy)
+```
+
+We can also plot alpha diversity measurements quite easily. The plot_richness command will plot each sample on the x-axis with its metric-specific score on the y-axis. It is worth noting that most alpha diversity metrics are not recommended for use with DADA-filtered data as most singletons will be removed through the filtering process. This is further explained in this post by the creator of dada2: https://github.com/benjjneb/dada2/issues/103. 
+
+```{r}
+alpha_meas = c("Shannon", "Simpson")
+plot_richness(phy, x = "Sample_Type", color = "Sample_Type", measures=alpha_meas)
+```
+
+Phyloseq can also perform diversity ordination methods. For the output in this particular case to be useful, the negative controls need to be removed. We are specifying an ordination method (in this case, NMDS) and a metric (Bray-Curtis). We can then plot this and add some additional aesthetic details as well as ellipses denoting 95% confidence intervals. We start by subsetting our phyloseq object (removing samples by designated column and column entry) and we can then check to make sure this worked by printing our sample data. We then use the ordinate function and built a ggplot graphic from this. 
+
+```{r}
+phy_subset = subset_samples(phy, Sample_Type != "Control")
+phy_subset@sam_data
+phy_bray = ordinate(phy_subset, "NMDS", "bray")
+p2 = plot_ordination(phy_subset, phy_bray, color = "Sample_Type") 
+p2 + geom_point(size=3) + ggtitle("Bray Curtis NMDS") + stat_ellipse(type = "norm", linetype = 2) + theme_bw()
+```
+
+To determine whether there is statistical significance between the different groups, we can run a PERMANOVA test on the distance matrix for this particular metric. We use the vegan package and the command adonis to accomplish this. We first extract our sample data from the phyloseq object, generate the distance matrix, and then run the command. 
+
+```{r}
+bray_df = data.frame(sample_data(phy_subset))
+phy_bray_dist = phyloseq::distance(phy_subset, "bray")
+adonis(phy_bray_dist ~ Sample_Type, data = bray_df)
+```
+
+This step will pull out a specific number of the most abundant ASVs (topN). It will then produce a barplot with bars colored based on phylum. We do this by sorting our object by summed taxa counts, extracting the top 20 rows from the resulting object, and then pruning our original object using this list. The resulting object will only contain the top 20 ASVs and can be plotted as before. This extraction technique could also be used to grab low abundant taxa as well if the total ASV count was known. 
+
+```{r}
+topN = 20
+top_20_abundant_features = sort(taxa_sums(phy), TRUE) [1:topN]
+phy_top_20 = prune_taxa(names(top_20_abundant_features), phy)
+plot_bar(phy_top_20, fill = "Phylum")
+```
+
+This will transform all sample counts to percent (relative) abundance. You can then produce bar plots again and in this case, the y-axis will be scaled as percents. You'll notice that samples without reads following decontamination present as empty slots in the graph. We use the transform_sample_counts function to apply a user-provided function to sample counts. In this case, we divide the value of each count by the summed counts in the row to give percent abundance. 
+
+```{r, fig.width= 8, fig.height= 10}
+phy_percent_abundance <- transform_sample_counts(phy_top_20, function(x) x / sum(x) )
+plot_bar(phy_percent_abundance, fill = "Phylum")
+```
+
+If you only want to look at a particular grouping of samples from your phyloseq object, you can subset. You will specify a column from your metadata file and then what group within that column you would like to separate. In the below example, "Sample_Type" is the metadata column and "Aquatic" is the group within the "Sample_Type" column that you want to look at exclusively. All other samples will be discarded.
+
+```{r}
+phy_subset = subset_samples(phy, Sample_Type == "Aquatic")
+head(phy_subset@sam_data)
+```
+
+We can see what our total read counts are for each sample by using the below command. 
+
+```{r}
+sample_sums(phy)
+```
+
+If you are wanting to rarefy your samples for certain ordination methods, this can be performed as below. If the "sample.size" argument is left out, it will rarefy to the lowest read count amongst all samples. It is important to note that we must remove samples with counts lower than what we are specifying in "sample.size" by subsetting before doing this. If we do not, this rarefaction function will ADD reads to samples below the cutoff until reaching your number. This is inadvisable. The option to "replace" is what causes this and can be changed as desired. If you select "False" without removing those low read samples it will throw an error. We use our subsetted object from earlier with controls removed to guarantee each sample has at least 1000 reads. 
+
+```{r}
+phy_rarefy = rarefy_even_depth(phy_subset, sample.size = "1000", replace = FALSE)
+sample_sums(phy_rarefy)
+```
+
+If you would like to filter out low abundance taxa or taxa that show up in only a few samples, etc, this can be performed as below. The below function is summing counts for each taxa across all samples and if summed counts are less than 5, those taxa are removed. 
+
+```{r}
+#number of taxa before filtering
+ntaxa(phy)
+phy_filter = filter_taxa(phy, function(x) sum(x) > 5, prune = TRUE)
+#number of taxa after filtering
+ntaxa(phy_filter)
+```
+
+Collapsing to a given taxonomic level can be useful when high resolution is not needed and larger trends are being looked for. Specify a level ("Genus"") and collapse all reads/ASVs into this level (ex: might be 20 Flavobacterium ASVs and this will collapse these all into one entry, "agglomerate" into genus Flavobacterium).
+  
+```{r}
+ntaxa(phy)
+phy_tax_glom_gen = tax_glom(phy, taxrank = "Genus")
+ntaxa(phy_tax_glom_gen)
+```
+
+#DESeq2
+>Estimate variance-mean dependence in count data from high-throughput sequencing assays and test for differential expression based on a model using the negative binomial distribution.
+
+*browseVignettes(DESeq2) for more information*
+
+This function is provided by phyloseq to import sequences to DESeq2, a differential abundance tool. DESeq2 is providing a similar function to beta diversity statistics but without rarefaction. It will result in telling you how similar or different two specified groups are and what is actually different between the two taxonomically. This is taking into account phylogeny and abundance of these groups. The model used by DESeq2 can handle samples having variable depths. The input is your desired phyloseq object and the metadata column you are interested in. As of this writing, DESeq2 performs pairwise comparisons so ensure that your column will only have two categories (you may need to make separate metadata columns for this purpose.). To account for needing two groups only, we will remove samples without a Subtype leaving only "Flowing" and "Stagnant" as categories. We denote the column to investigate in the second command with the "~" and the conversion command "phyloseq_to_deseq2". We then run the base DESeq command and specify the test and fitType. For test, you can choose "Wald" or "LRT" (likelihood ratio test) and fitType can be "mean", "local", or "parametric". Parametric is considered to be the most robust and Wald is the default for test. Reading the vignette can give more detail as desired.
+
+It will perform the following steps:
+1. estimation of size factors: estimateSizeFactors
+2. estimation of dispersion: estimateDispersions
+3. Negative Binomial GLM fitting and Wald statistics: nbinomWaldTest (or LRT if specified)
+
+
+```{r}
+phy_subset_DeSEQ2 = subset_samples(phy_tax_glom_gen, Subtype != "NA")
+DESeq2_format = phyloseq_to_deseq2(phy_subset_DeSEQ2, ~Subtype)
+DESeq2_format = DESeq(DESeq2_format, test="Wald", fitType="parametric")
+```
+
+We are next setting an adjusted p value cutoff for each result as "alpha". This can be changed as desired. Setting cooksCutoff to FALSE in the "results" command prevents p-values from being reset and is advised. We then make a table of significantly differential taxa by comparing values in the "res" object's padj column and copying ones with values below our alpha cutoff. 
+
+```{r}
+res = results(DESeq2_format, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab = res[which(res$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(phy_subset_DeSEQ2)[rownames(sigtab), ], "matrix"))
+
+```
+
+Check to make sure your data looks good. You should see feature IDs, log2fold changes, base mean values, adjusted and non-adjusted p-values, and taxonomic information.
+
+```{r}
+head(sigtab)
+```
+
+Looking at "res" is only really needed to look at which variable is being tested first. This aids in interpretation of the plot below (ex. Treatment vs No Treatment OR No Treatment vs Treatment). The res tab has all results following model fitting but BEFORE the p-value cutoff, so you will still see non significant p-values. Sigtab is what will be used for figure generation and will only contain results that are deemed significant based on your "alpha" value. 
+
+```{r}
+head(res)
+```
+
+This will generate a differential abundance plot with log2fold change on the x-axis and a specified taxonomic level on the x-axis. You can color to a taxonomic level as well. The commands that precede the final ggplot command are setting up the final figure (assigning color palettes, sorting values, determining what level to display on the y-axis). If you are wanting other levels for color or the y-axis, simply change what you are calling in the below commands to the level desired. If you didn't want multiple ASVs shown for each genus, you could collapse your phyloseq object to a higher level as described earlier and then feed it into DESeq2. The same goes for filtering out other unwanted data, this should be done before running it through DESeq2. The figure below is interpreted by what we saw in the "res" table. Taxa elevated in the "River" group are to the right and we see that many are 20-fold more abundant in River samples than Lake samples. Taxa elevated in the "Lake" group are to the left. Keep in mind that sample size should be relatively large to draw real conclusions from these differential abundance models. Additionally, the second set of commands will generate a plot with the axes flipped which may be preferential for viewing.
+
+```{r, fig.show="hold"}
+theme_set(theme_bw())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+     scale_fill_brewer(palette = palname, ...)
+ }
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(y=Genus, x=log2FoldChange, color=Phylum)) + geom_vline(xintercept = 0.0, color = "gray", size = 0.5) + geom_point(size=6) + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) + geom_point(size=6) + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+
+#pheatmap
+
+>A package for drawing pretty heatmaps in R. The ordinary heatmap function in R has several drawbacks when it comes to producing publication quality heatmaps. It is hard to produce pictures with consistent text, cell and overall sizes and shapes. The function pheatmap tries to alleviate the problems by offering more fine grained control over heatmap dimensions and appearance.
+
+*https://cran.r-project.org/web/packages/pheatmap/pheatmap.pdf for more information*
+
+Phyloseq has a heat map function that functions well for general exploratory purposes. We are also using our subsetted dataset without the low read count samples as those can cause errors when generating heat maps in phyloseq. This function will order samples and taxa based on a specified ordination method and distance. This is often recommended at it will try to group samples that cluster based on that particular metric, making it easier to determine particular taxa that are causing differences. You will notice that there are still so many entries on the y-axis (ASVs) that they cannot be displayed. We will remedy this next. 
+
+```{r, fig.width= 8, fig.height= 10}
+phy_bacteroidetes = subset_taxa(phy_subset, Phylum == "Bacteroidetes")
+plot_heatmap(phy_bacteroidetes, method = "NMDS", distance = "bray")
+```
+
+You can take a few different approaches to reduce the number of taxa displayed on the y-axis. You could prune low abundance taxa (using prune_taxa) or you can agglomerate taxa to a particular level. Below we agglomerate to the "genus" level meaning all ASVs are pooled under a single genus entry. We can also order our samples without using an ordination method and instead force it to use a metadata column ("Sample_Type", in this case). This now groups all samples within a particular category together on the x-axis. We can also order the genera on the y-axis by a higher rank, here specified as "Family". Other options include changing colors used to denote high or low abundance and specifying what you would like the first and last sample to be. Currently, you are not able to edit the scale bar on the side. You could however change your input data to adjust this (change counts to percent abundance, log transform, etc).
+
+```{r, fig.width= 8, fig.height= 10}
+phy_genus_bacteroidetes_glom = tax_glom(phy_bacteroidetes, "Genus")
+plot_heatmap(phy_genus_bacteroidetes_glom, taxa.label = "Genus", sample.order = "Sample_Type", taxa.order = "Family", low="#000033", high="#FF3300")
+```
+
+However, the customization within phyloseq heat maps stops there for the most part. This can be somewhat limiting as far as adding additional layers or graphics to overlay on the heat map. The package "pheatmap" provides this additional capacity which can come in handy. Keep in mind, this is not associated with phyloseq so we will need to move data out of our phyloseq object to a more base R-friendly format. I'll first show what would happen if you just use your OTU table from your phyloseq object as input (this ain't gone be pretty).  
+
+```{r, fig.width= 8, fig.height= 10}
+pheatmap(phy@otu_table)
+```
+
+Above, clustering is done in a hierarchical manner (more classical) which is why we see a tree-like breakdown on both axes. The y-axis has the ASVs (that giant mass of black is actually just densely packed feature IDs from Qiime) and the x-axis has our samples ordered based on similarities in abundance of particular taxa. 
+
+Next, I'll show how we can preprocess our input data and also reorder axes in particular ways. 
+
+Let's use our agglomerated phyloseq object from before (collapsed to the genus level with all samples present). We can override the hierarchical clustering of samples and taxa with the following "cluster" commands.
+
+```{r, fig.width= 8, fig.height= 10}
+pheatmap_glom_gen = pheatmap(phy_tax_glom_gen@otu_table, cluster_rows = FALSE, cluster_cols = FALSE)
+```
+
+We are still seeing feature IDs listed on the y-axis which isn't particularly useful or informative. Let's use some base R functions to extract desired columns and rows for a new table. First, we will trim out taxa by total abundance summed across samples which will reduce some of the clutter on the y-axis. We'll then extract genus names from the phyloseq taxonomy table. Then, we can extract sample IDs and associated counts from the phyloseq OTU table. We use our extracted tax table (as a factor) to index and match our extraction from the OTU table. We can take a look at our resulting object below. 
+
+```{r}
+phy_tax_glom_gen_trimmed = filter_taxa(phy_tax_glom_gen, function(x) sum(x) > 250, TRUE)
+genfac = factor(tax_table(phy_tax_glom_gen_trimmed)[, "Genus"])
+gentab = apply(otu_table(phy_tax_glom_gen_trimmed), MARGIN = 2, function(x) {
+     tapply(x, INDEX = genfac, FUN = sum, na.rm = TRUE, simplify = TRUE)
+ })
+head(gentab) [, 1:10]
+colnames(gentab)
+rownames(gentab) [1:10]
+```
+
+We now have our intended object for use with pheatmap as a baseR object (no longer in phyloseq/easier to manipulate). We are intending on ordering the genera by phylum in our finished product. We can use the psmelt function to melt our phyloseq object into a single object which will allow for reorganization. 
+```{r}
+melted_phy_table = psmelt(phy_tax_glom_gen_trimmed)
+colnames(melted_phy_table)
+```
+
+This block will reorder your melted phyloseq object by phylum which will help when annotating our finalized heat map. Using the "order" command will order an object by a specified column alphabetically which suffices for our purposes. 
+
+```{r}
+reordered_melted = melted_phy_table[order(melted_phy_table$Phylum),]
+```
+
+We now need to reorder our gentab object made earlier according to phylum. Keep in mind that gentab has genera as rows and samples as columns with counts represented in the matrix. We will first use a dplyr command called "distinct" to remove duplicate values based on a specified column (Genus, in this case). This is similar to the remove duplicates function in Excel. I also commented in an alternate method using base R functionality to attain a genus list to sort your gentab object by. It is is important that there are no duplicates as this will prevent the sorting of your gentab object by this list. The first option has the added benefit of keeping phylum assignments present which we will utilize next. The reordering commands specify an order for the rows of gentab (the genera) as well as an alphabetical sorting of the columns (the samples). 
+
+```{r}
+reordered_melted_no_genus_dups = reordered_melted %>% distinct(Genus, .keep_all = TRUE)
+#genus_list = reordered_melted$Genus
+#genus_list_no_dups = genus_list[!duplicated(genus_list)]
+gentab_reorder = gentab[reordered_melted_no_genus_dups$Genus, order(colnames(gentab))]
+```
+
+Let's now plot our reordered data and update the font size so it is easier to read. 
+
+```{r, fig.width= 8, fig.height= 10}
+pheatmap_gen_glom_reorder_by_phylum = pheatmap(gentab_reorder, cluster_cols = FALSE, cluster_rows = FALSE, fontsize = 7)
+```
+
+The above heat map has good functionality but for the most part, the phyloseq options can attain this for you. Pheatmap provides the option for additional layers and we will utilize that next by coloring our genera by phylum. We will build a data frame using the phylum column from the reordered object in the previous section. We then assign rownames as the genera. This now acts as a key for annotating our heat map.
+
+```{r, fig.width= 8, fig.height= 10}
+phyla_frame = data.frame(Phylum = reordered_melted_no_genus_dups$Phylum)
+rownames(phyla_frame) = reordered_melted_no_genus_dups$Genus
+head(phyla_frame)
+pheatmap_gen_glom_reorder_by_phylum = pheatmap(gentab_reorder, cluster_cols = FALSE, cluster_rows = FALSE, annotation_row = phyla_frame, fontsize = 7)
+```
+
+It can be difficult to pick out differences in abundance using absolute counts. Log transforming your data can allow one to note large differences in abundance. This is accomplished by simply adding "log10" in front of the data object you are using and adding a pseudocount (+1) to account for zeroes in your data table. The scale is now logarithmic and this should be noted when performing this transformation. We will also adjust the color palette and add breaks between columns to denote groupings of samples. The color palette used here is from the package "viridis" which has color schemes that are interpretable by colorblind individuals. This is also applicable to taxa where gaps can be added between the phyla to aid in differentiation (where "gaps_rows" is used instead of "gaps_cols""). We will also adjust the column font size and the angle of the column text as well to improve display. For the sake of this tutorial, annotation colors won't be adjusted but they can be specified with an input vector as desired (annotation_colors). It should also be noted that samples can be annotated in a similar way as phyla where annotations along the top of the figure are added (for instance, denoting sample type or treatment group).
+
+```{r, fig.width= 8, fig.height= 10} 
+pheatmap_gen_glom_reorder_by_phylum = pheatmap(log10(gentab_reorder+1), color = inferno(10), scale = "none", gaps_col = c(2,4,7,9,12,15,17,19,22), cluster_cols = FALSE, cluster_rows = FALSE,
+                                               annotation_row = phyla_frame, angle_col = 315, fontsize_row = 6, fontsize_col = 8)
+pheatmap_gen_glom_reorder_by_phylum = pheatmap(log10(gentab_reorder+1), color = viridis(10), scale = "none", gaps_col = c(2,4,7,9,12,15,17,19,22), cluster_cols = FALSE, cluster_rows = FALSE,
+                                               annotation_row = phyla_frame, angle_col = 315, fontsize_row = 6, fontsize_col = 8)
+```
+
